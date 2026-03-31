@@ -1,0 +1,564 @@
+/**
+ * echo.c — lwIP TCP DMA Streaming Server with Circular Buffer
+ *           + CORDIC dual-channel frequency control via TCP
+ *
+ * Architecture:
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  FPGA Fabric                                                    │
+ * │  [CORDIC 0] ──┐                                                 │
+ * │               ├──► [axis_stream_packer] ──► [AXI DMA S2MM]     │
+ * │  [CORDIC 1] ──┘                                                 │
+ * │                                                                 │
+ * │  [AXI GPIO 32-bit] ──► [15:0]  → CORDIC 0 config               │
+ * │                    └──► [31:16] → CORDIC 1 config               │
+ * └───────────────────────────────────┬─────────────────────────────┘
+ *                                     │ DMA writes into next free slot
+ *                                     ▼
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  Circular Buffer (DDR)                                          │
+ * │                                                                 │
+ * │  [ slot 0 ][ slot 1 ][ slot 2 ][ slot 3 ] ... [ slot N-1 ]     │
+ * │       ▲                              ▲                          │
+ * │   send_idx                       dma_idx                        │
+ * │  (TCP sending)               (DMA filling)                      │
+ * └─────────────────────────────────────────────────────────────────┘
+ *                                     │
+ *                                     ▼
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  lwIP TCP ──► Ethernet ──► PC                                   │
+ * │                                                                 │
+ * │  PC ──► TCP (port 7) ──► 4-byte control packet                  │
+ * │           [freq0_lo][freq0_hi][freq1_lo][freq1_hi]              │
+ * │           → AXI GPIO → CORDIC 0 & 1 config ports               │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * Control packet format (PC → Zynq, 4 bytes, little-endian):
+ *   Bytes [0..1]  uint16_t  freq_word_0   (CORDIC 0 phase increment)
+ *   Bytes [2..3]  uint16_t  freq_word_1   (CORDIC 1 phase increment)
+ *
+ * AXI GPIO register layout (32-bit, channel 1):
+ *   gpio_io_o[15:0]  → CORDIC 0 s_axis_config_tdata
+ *   gpio_io_o[31:16] → CORDIC 1 s_axis_config_tdata
+ *
+ * Why circular buffer over ping-pong:
+ *   Ping-pong has 1 slot of slack. One TCP stall = data corruption.
+ *   Circular buffer with N slots gives (N-1) slots of slack, so TCP
+ *   can stall for (N-1) x packet_duration without losing data.
+ *   Overrun (DMA catching send pointer) is detected and reported.
+ *
+ * Cache discipline (Cortex-A9 write-back cache):
+ *   Flush   (writeback+invalidate) BEFORE DMA start:
+ *     CPU hands memory to DMA. Ensures DMA sees clean DDR.
+ *   Invalidate AFTER DMA complete, BEFORE CPU read:
+ *     CPU takes memory back from DMA. Discards stale cache lines.
+ *
+ * State machine:
+ *   IDLE -> DMA_RUNNING -> SEND_PENDING -> DMA_RUNNING -> ...
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "xaxidma.h"
+#include "xgpio.h"
+#include "xparameters.h"
+#include "xil_cache.h"
+
+#include "lwip/err.h"
+#include "lwip/tcp.h"
+#include "lwip/pbuf.h"
+
+#if defined (__arm__) || defined (__aarch64__)
+#include "xil_printf.h"
+#endif
+
+/* ================================================================
+ * Configuration
+ * ================================================================ */
+
+/** 64-bit samples per DMA transfer / TCP packet */
+#define SAMPLES_PER_PACKET  100
+
+/**
+ * Number of circular buffer slots. Must be a power of 2.
+ * Headroom = NUM_SLOTS - 1 packets before data loss on TCP stall.
+ *   4 slots =  3200 bytes DDR,  3 packets headroom
+ *   8 slots =  6400 bytes DDR,  7 packets headroom  (recommended)
+ *  16 slots = 12800 bytes DDR, 15 packets headroom
+ */
+#define NUM_SLOTS           8
+
+/** TCP port — same port handles both stream TX and control RX */
+#define TCP_PORT            7
+
+/** AXI GPIO device ID for CORDIC frequency control */
+#define CORDIC_GPIO_DEVICE_ID   XPAR_AXI_GPIO_0_DEVICE_ID
+
+/* ================================================================
+ * Derived constants
+ * ================================================================ */
+
+#define BYTES_PER_PACKET    (SAMPLES_PER_PACKET * sizeof(u64))
+#define SLOT_MASK           (NUM_SLOTS - 1)
+
+#if (NUM_SLOTS & (NUM_SLOTS - 1)) != 0
+#error "NUM_SLOTS must be a power of 2 (4, 8, 16, ...)"
+#endif
+
+/* ================================================================
+ * Circular buffer
+ *
+ * circ_buf[slot][sample] laid out in DDR.
+ * Each slot is independently 32-byte aligned (= Cortex-A9 cache
+ * line size) so cache operations on one slot never touch another.
+ *
+ * Indices (unsigned, wrap via & SLOT_MASK):
+ *   dma_idx  — slot DMA is currently writing into
+ *   send_idx — oldest filled slot not yet sent over TCP
+ *
+ * Filled slots waiting to send = (dma_idx - send_idx) & SLOT_MASK
+ * ================================================================ */
+
+static u64 circ_buf[NUM_SLOTS][SAMPLES_PER_PACKET] __attribute__((aligned(32)));
+
+static u32 dma_idx  = 0;
+static u32 send_idx = 0;
+
+/* ================================================================
+ * DMA + GPIO + state
+ * ================================================================ */
+
+static XAxiDma AxiDma;
+static XGpio   CordicGpio;
+
+typedef enum {
+    STATE_IDLE,
+    STATE_DMA_RUNNING,   /* DMA filling current slot                    */
+    STATE_SEND_PENDING,  /* DMA done, slots ready, waiting for TCP room */
+} AppState;
+
+static AppState        app_state     = STATE_IDLE;
+static struct tcp_pcb *client_pcb    = NULL;
+static u32             overrun_count = 0;
+
+/* ================================================================
+ * Forward declarations
+ * ================================================================ */
+
+static int   start_dma_into_slot(u32 slot);
+static void  on_dma_complete(void);
+static err_t tcp_sent_cb(void *arg, struct tcp_pcb *tpcb, u16_t len);
+static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
+static void  tcp_error_cb(void *arg, err_t err);
+
+/* ================================================================
+ * Circular buffer helpers
+ * ================================================================ */
+
+/** How many slots are filled and waiting to be sent */
+static inline u32 slots_filled(void)
+{
+    return (dma_idx - send_idx) & SLOT_MASK;
+}
+
+/** How many slots are free for the next DMA transfer */
+static inline u32 slots_free(void)
+{
+    /* -1 because dma_idx slot is actively being filled right now */
+    return NUM_SLOTS - 1 - slots_filled();
+}
+
+/* ================================================================
+ * DMA helpers
+ * ================================================================ */
+
+/**
+ * start_dma_into_slot()
+ *
+ * Flush the slot from CPU cache to DDR, then kick off S2MM transfer.
+ * After this returns successfully, DMA owns the slot memory.
+ */
+static int start_dma_into_slot(u32 slot)
+{
+    UINTPTR addr   = (UINTPTR)circ_buf[slot & SLOT_MASK];
+    int     status;
+
+    /* CPU -> DMA handover: writeback dirty lines, mark clean */
+    Xil_DCacheFlushRange(addr, BYTES_PER_PACKET);
+
+    status = XAxiDma_SimpleTransfer(
+        &AxiDma,
+        addr,
+        BYTES_PER_PACKET,
+        XAXIDMA_DEVICE_TO_DMA
+    );
+
+    if (status != XST_SUCCESS) {
+        xil_printf("[DMA] Transfer into slot %lu failed: %d\n\r",
+                   (unsigned long)(slot & SLOT_MASK), status);
+        return -1;
+    }
+
+    app_state = STATE_DMA_RUNNING;
+    return 0;
+}
+
+/**
+ * on_dma_complete()
+ *
+ * Called once we detect !XAxiDma_Busy().
+ *  1. Invalidate completed slot — DMA -> CPU handover
+ *  2. Advance dma_idx (mark slot as filled)
+ *  3. Detect overrun, recover by dropping oldest unsent slot
+ *  4. Start next DMA if a free slot exists, else pause until TCP drains
+ */
+static void on_dma_complete(void)
+{
+    u32 completed = dma_idx & SLOT_MASK;
+
+    /* DMA -> CPU handover: discard stale cache, read what DMA wrote */
+    Xil_DCacheInvalidateRange((UINTPTR)circ_buf[completed], BYTES_PER_PACKET);
+
+    /* Mark slot as filled */
+    dma_idx = (dma_idx + 1) & SLOT_MASK;
+
+    /* Overrun check: dma_idx lapped send_idx */
+    if (dma_idx == send_idx) {
+        overrun_count++;
+        xil_printf("[CIRC] Overrun #%lu — dropping oldest slot\n\r",
+                   (unsigned long)overrun_count);
+        /* Drop oldest unsent slot to make room */
+        send_idx = (send_idx + 1) & SLOT_MASK;
+    }
+
+    /* Start next DMA if there is a free slot */
+    if (slots_free() > 0) {
+        start_dma_into_slot(dma_idx);
+    } else {
+        /* Buffer full — pause DMA until tcp_sent_cb drains a slot */
+        xil_printf("[CIRC] Buffer full — DMA paused\n\r");
+        app_state = STATE_SEND_PENDING;
+    }
+}
+
+/* ================================================================
+ * Main poll function
+ * Call this every iteration of the main loop (alongside xemacif_input)
+ * ================================================================ */
+
+void send_samples(void)
+{
+    if (!client_pcb) return;
+
+    switch (app_state) {
+
+        /* ── Poll DMA completion ──────────────────────────────── */
+        case STATE_DMA_RUNNING:
+
+            if (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) {
+                break; /* not done yet — come back next loop */
+            }
+
+            on_dma_complete(); /* process completed slot, start next DMA */
+            /* FALLTHROUGH — try to send immediately */
+
+        /* ── Drain filled slots into TCP ──────────────────────── */
+        case STATE_SEND_PENDING:
+
+            /*
+             * Send every filled slot that fits in the TCP window.
+             * Looping here drains backlog quickly after a TCP stall.
+             */
+            while (slots_filled() > 0) {
+
+                if (tcp_sndbuf(client_pcb) < (u16_t)BYTES_PER_PACKET) {
+                    /*
+                     * Window full — stay SEND_PENDING.
+                     * tcp_sent_cb will call us back when window opens.
+                     */
+                    app_state = STATE_SEND_PENDING;
+                    return;
+                }
+
+                u32 slot = send_idx & SLOT_MASK;
+
+                err_t err = tcp_write(
+                    client_pcb,
+                    circ_buf[slot],
+                    (u16_t)BYTES_PER_PACKET,
+                    TCP_WRITE_FLAG_COPY  /* lwIP copies — safe to reuse slot */
+                );
+
+                if (err != ERR_OK) {
+                    xil_printf("[TCP] tcp_write error: %d\n\r", err);
+                    app_state = STATE_SEND_PENDING;
+                    return;
+                }
+
+                /* Advance send pointer — slot is now free for DMA reuse */
+                send_idx = (send_idx + 1) & SLOT_MASK;
+
+                /*
+                 * If DMA was paused because the buffer was full,
+                 * we just freed a slot — restart DMA now.
+                 */
+                if (!XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA) &&
+                    app_state == STATE_SEND_PENDING) {
+                    start_dma_into_slot(dma_idx);
+                }
+            }
+
+            /* All backlog sent — push to network immediately */
+            tcp_output(client_pcb);
+
+            app_state = STATE_DMA_RUNNING;
+            break;
+
+        case STATE_IDLE:
+        default:
+            break;
+    }
+}
+
+/* ================================================================
+ * TCP callbacks
+ * ================================================================ */
+
+/**
+ * tcp_recv_cb — receives frequency control words from PC
+ *
+ * Packet format (4 bytes total, little-endian):
+ *   Bytes [0..1]  uint16_t  freq_word_0   (CORDIC 0 phase increment)
+ *   Bytes [2..3]  uint16_t  freq_word_1   (CORDIC 1 phase increment)
+ *
+ * GPIO register layout written:
+ *   bits [15:0]  = freq_word_0  → CORDIC 0 s_axis_config_tdata
+ *   bits [31:16] = freq_word_1  → CORDIC 1 s_axis_config_tdata
+ */
+static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb,
+                         struct pbuf *p, err_t err)
+{
+    (void)arg;
+
+    /* Client disconnected cleanly */
+    if (!p) {
+        xil_printf("[TCP] Client closed connection\n\r");
+        tcp_close(tpcb);
+        client_pcb = NULL;
+        return ERR_OK;
+    }
+
+    if (err != ERR_OK) {
+        pbuf_free(p);
+        return err;
+    }
+
+    /* Expect exactly 4 bytes — two 16-bit freq words */
+    if (p->tot_len == 4) {
+        u8 buf[4];
+        pbuf_copy_partial(p, buf, 4, 0);
+
+        u16_t freq0 = (u16_t)(buf[0] | (buf[1] << 8));  /* CORDIC 0, little-endian */
+        u16_t freq1 = (u16_t)(buf[2] | (buf[3] << 8));  /* CORDIC 1, little-endian */
+
+        /*
+         * Pack both words into one 32-bit GPIO write:
+         *   Lower 16 bits → CORDIC 0 (gpio_io_o[15:0])
+         *   Upper 16 bits → CORDIC 1 (gpio_io_o[31:16])
+         */
+        u32 gpio_val = ((u32)freq1 << 16) | (u32)freq0;
+        XGpio_DiscreteWrite(&CordicGpio, 1, gpio_val);
+
+        xil_printf("[CTRL] CORDIC0=0x%04X  CORDIC1=0x%04X\n\r",
+                   (unsigned)freq0, (unsigned)freq1);
+    } else {
+        xil_printf("[CTRL] Unexpected packet len: %d (expected 4)\n\r", p->tot_len);
+    }
+
+    /* Tell lwIP we consumed all received bytes */
+    tcp_recved(tpcb, p->tot_len);
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+/**
+ * tcp_sent_cb — remote host ACK'd data, TCP window has opened.
+ * Resume sending if we were stalled.
+ */
+static err_t tcp_sent_cb(void *arg, struct tcp_pcb *tpcb, u16_t len)
+{
+    (void)arg; (void)tpcb; (void)len;
+
+    if (app_state == STATE_SEND_PENDING) {
+        send_samples();
+    }
+    return ERR_OK;
+}
+
+/**
+ * tcp_error_cb — fatal TCP error (RST, timeout, etc.)
+ * lwIP has already freed the PCB at this point — do NOT call
+ * any tcp_* function with client_pcb after this fires.
+ */
+static void tcp_error_cb(void *arg, err_t err)
+{
+    (void)arg;
+
+    xil_printf("[TCP] Connection lost (err=%d)\n\r", err);
+    xil_printf("[TCP] Session overruns: %lu\n\r", (unsigned long)overrun_count);
+
+    client_pcb    = NULL;  /* PCB freed by lwIP — null our reference */
+    overrun_count = 0;
+
+    /* Reset ring pointers for the next client session */
+    dma_idx  = 0;
+    send_idx = 0;
+
+    /* Keep DMA running — it will fill slots until a new client connects */
+    app_state = STATE_DMA_RUNNING;
+}
+
+/**
+ * accept_callback — new TCP client connected.
+ */
+err_t accept_callback(void *arg, struct tcp_pcb *newpcb, err_t err)
+{
+    (void)arg;
+
+    if (err != ERR_OK || !newpcb) {
+        xil_printf("[TCP] Accept error: %d\n\r", err);
+        return ERR_VAL;
+    }
+
+    if (client_pcb != NULL) {
+        xil_printf("[TCP] Rejecting second client\n\r");
+        tcp_abort(newpcb);
+        return ERR_ABRT;
+    }
+
+    client_pcb = newpcb;
+
+    tcp_recv(newpcb, tcp_recv_cb);    /* receive freq control words    */
+    tcp_nagle_disable(newpcb);        /* send each packet immediately  */
+    tcp_sent(newpcb, tcp_sent_cb);    /* unblock on remote ACK         */
+    tcp_err(newpcb,  tcp_error_cb);   /* safe disconnect handling      */
+
+    xil_printf("[TCP] Client connected\n\r");
+    xil_printf("[CIRC] %d slots x %d bytes = %d bytes circular buffer\n\r",
+               NUM_SLOTS, (int)BYTES_PER_PACKET,
+               (int)(NUM_SLOTS * BYTES_PER_PACKET));
+
+    send_samples(); /* kick off sending — slots may already be ready */
+    return ERR_OK;
+}
+
+/* ================================================================
+ * print_app_header — call before lwIP init in main.c
+ * ================================================================ */
+
+void print_app_header(void)
+{
+#if (LWIP_IPV6 == 0)
+    xil_printf("\n\r\n\r----- lwIP TCP DMA Streaming Server -----\n\r");
+#else
+    xil_printf("\n\r\n\r----- lwIPv6 TCP DMA Streaming Server -----\n\r");
+#endif
+    xil_printf("  Samples/packet     : %d\n\r", SAMPLES_PER_PACKET);
+    xil_printf("  Bytes/packet       : %d\n\r", (int)BYTES_PER_PACKET);
+    xil_printf("  Circular buf slots : %d\n\r", NUM_SLOTS);
+    xil_printf("  Circular buf size  : %d bytes\n\r",
+               (int)(NUM_SLOTS * BYTES_PER_PACKET));
+    xil_printf("  TCP port           : %d\n\r", TCP_PORT);
+    xil_printf("  CORDIC GPIO dev    : %d\n\r", CORDIC_GPIO_DEVICE_ID);
+    xil_printf("-----------------------------------------\n\r");
+}
+
+/* ================================================================
+ * start_application — call once after lwIP stack is initialised
+ * ================================================================ */
+
+int start_application(void)
+{
+    XAxiDma_Config *CfgPtr;
+    struct tcp_pcb  *pcb;
+    err_t  err;
+    int    status, i;
+
+    /* ── Init AXI GPIO for CORDIC freq control ───────────── */
+
+    status = XGpio_Initialize(&CordicGpio, CORDIC_GPIO_DEVICE_ID);
+    if (status != XST_SUCCESS) {
+        xil_printf("[GPIO] Init failed: %d\n\r", status);
+        return -1;
+    }
+
+    /* Set all 32 pins as outputs (0 = output) */
+    XGpio_SetDataDirection(&CordicGpio, 1, 0x00000000);
+
+    /* Start both CORDICs at zero frequency */
+    XGpio_DiscreteWrite(&CordicGpio, 1, 0x00000000);
+
+    xil_printf("[GPIO] CORDIC freq control ready (CORDIC0=0, CORDIC1=0)\n\r");
+
+    /* ── Init AXI DMA ─────────────────────────────────────── */
+
+    CfgPtr = XAxiDma_LookupConfig(XPAR_AXIDMA_0_DEVICE_ID);
+    if (!CfgPtr) {
+        xil_printf("[DMA] Config not found\n\r");
+        return -1;
+    }
+
+    status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (status != XST_SUCCESS) {
+        xil_printf("[DMA] Init failed: %d\n\r", status);
+        return -1;
+    }
+
+    /* Polled mode — disable interrupts to prevent spurious exceptions */
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+
+    /* ── Flush all slots to DDR ──────────────────────────── */
+
+    for (i = 0; i < NUM_SLOTS; i++) {
+        Xil_DCacheFlushRange((UINTPTR)circ_buf[i], BYTES_PER_PACKET);
+    }
+
+    /* ── Start first DMA transfer into slot 0 ────────────── */
+
+    dma_idx  = 0;
+    send_idx = 0;
+
+    status = start_dma_into_slot(0);
+    if (status != 0) {
+        xil_printf("[DMA] First transfer failed\n\r");
+        return -1;
+    }
+
+    xil_printf("[DMA] Started — filling slot 0\n\r");
+
+    /* ── TCP server ──────────────────────────────────────── */
+
+    pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
+    if (!pcb) {
+        xil_printf("[TCP] PCB alloc failed\n\r");
+        return -1;
+    }
+
+    err = tcp_bind(pcb, IP_ANY_TYPE, TCP_PORT);
+    if (err != ERR_OK) {
+        xil_printf("[TCP] Bind failed: %d\n\r", err);
+        return -2;
+    }
+
+    pcb = tcp_listen(pcb);
+    if (!pcb) {
+        xil_printf("[TCP] Listen failed\n\r");
+        return -3;
+    }
+
+    tcp_accept(pcb, accept_callback);
+
+    xil_printf("[TCP] Listening on port %d\n\r", TCP_PORT);
+    return 0;
+}

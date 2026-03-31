@@ -77,7 +77,9 @@ Run Block Automation after adding the AXI DMA. This will automatically connect t
 You should now see a ready-to-use AXI DMA block with a floating S_AXI_S2MM interface:
 
 <img width="674" height="533" alt="image" src="https://github.com/user-attachments/assets/8eb47c11-5586-485b-8760-a8b0d49708b3" />
+
 Vitis Setup (lwIP Echo Server)
+
 Export Hardware & Create Application
 
 After exporting the .xsa file from Vivado, use it in Vitis to set up a custom echo server application.

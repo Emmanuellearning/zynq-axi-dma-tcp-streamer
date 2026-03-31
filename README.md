@@ -146,6 +146,9 @@ Output Waveforms:
 Moving further, I wanted to change the characteristics of the my stream using inputs from the pc side with the gui. For this i Setup an axigpio in the PL end.
 <img width="1546" height="613" alt="image" src="https://github.com/user-attachments/assets/7628172d-7928-4c85-814f-e9c83b440808" />
 
+By making an input option in the gui:
+<img width="1333" height="792" alt="image" src="https://github.com/user-attachments/assets/3e660b51-a4c3-4c92-919a-bc91a2643987" />
+
 
 ---
 
